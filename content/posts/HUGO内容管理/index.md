@@ -128,7 +128,8 @@ page bundles分为两种：
 支持HTML和Markdown
 
 ## Front Matter
-是以yaml、toml、json格式位于内容文件头部的一些元数据
+是以yaml、toml、json格式位于内容文件头部的一些元数据  
+在这里定义的变量会覆盖在主站配置config.toml里`[params.page]`中的变量
 ```toml
 categories = ["Development", "VIM"]
 date = "2012-04-06"
@@ -235,7 +236,6 @@ Shortcodes可以在内容文件中使用调用内建或者自定义的模板。
 
 ## 关联页面内容
 hugo根据页面front matters中的（tags，keywords，date）来关联各个页面。  
----
 layouts/partials/related.html
 ```html
 {{ $related := .Site.RegularPages.Related . | first 5 }}
