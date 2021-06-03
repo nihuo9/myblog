@@ -18,5 +18,5 @@ func main() {
 	r := gin.Default()
 	r.Static("/", "public")
 
-	log.Fatal(autotls.Run(r, "www.oshirisu.site"))
+	log.Fatal(autotls.Run(r, "oshirisu.site", "www.oshirisu.site"))
 }

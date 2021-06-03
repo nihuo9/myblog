@@ -22,9 +22,9 @@ enableComment: true
 
 resources:
 - name: "featured-image"
-  src: "featured-image.jpg"
+  src: "featured-image.png"
 - name: featured-image-preview
-  src: featured-image-preview.jpg
+  src: featured-image-preview.png
 
 featuredImage: ""
 featuredImagePreview: ""
