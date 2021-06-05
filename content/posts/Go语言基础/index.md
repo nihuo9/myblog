@@ -2729,7 +2729,7 @@ func makeThumbnails2(filenames []string) {
 }
 ```
 这一版运行真的太快了，事实上，即使在文件名称slice中只有一个元素的情况下，它也比原始版本要快。如果这里完全没有并行机制，并发的版本怎么可能运行的更快？答案是该函数在没有完成的事情之前就返回了。它启动了所有的goroutine，但没有等它们执行完毕。  
-没有一个直接的访问等待goroutine结束，但是可以修改内层goroutine，通过一个共享的通道发送事件事件来向外层goroutine报告它的完成。因为我们知道`len(filenames)`内层goroutine1的确切个数，所以外层goroutine只需要在返回前对完成事件进行计数：
+没有一个直接的访问等待goroutine结束，但是可以修改内层goroutine，通过一个共享的通道发送事件事件来向外层goroutine报告它的完成。因为我们知道`len(filenames)`内层goroutine的确切个数，所以外层goroutine只需要在返回前对完成事件进行计数：
 ```Go
 func makeThumbnails3(filenames []string) {
   ch := make(chan struct{})
@@ -2981,14 +2981,652 @@ func walkDir(dir string, n *sync.WaitGroup, fileSizes chan<- int64) {
 在walkDir循环中来进行取消状态轮询也许是划算的，它避免在取消后创建新的goroutine。取消需要权衡：更快的响应通常需要更多的程序逻辑变更入侵。确保在取消事件以后没有更多昂贵的操作发生，可能需要更新代码中很多的地方，但通常我们可以通过在少量重要的地方检查取消状态来达到目的。  
 现在，当取消事件发生时，所有的后台goroutine迅速停止，然后main函数返回。当然，当main返回时，程序随之退出，不过这里没有谁在后面通知main函数来进行清理。在测试中有一个技巧：如果在取消事件到来的时候main函数没有返回，执行一个panic调用，然后运行时将转储程序中所有goroutine的栈。如果主goroutine是最后一个剩下的goroutine，它需要自己清理。但如果还有其它的goroutine存活，它们可能还没有合适地取消，或者它们已经取消，可是需要的时间比较长；多一点调查总是值得的。崩溃转储信息通常含有足够的信息来分辨这些情况。
 
-## 异步设施
+## 使用共享变量实现并发
 ### 竞态
+在串行程序中（即一个程序只有一个goroutine），程序中各个步骤的执行顺序由程序逻辑来决定。比如，在一系列语句中，第一句在第二句之前执行，以此类推。当一个程序有两个或者多个goroutine时，每个goroutine内部的各个步骤也是顺序执行的，但我们无法确定一个goroutine中的事件x和另外一个goroutine中的事件y的先后顺序。如果我们无法自信地说一个事件肯定先于另一个事件，那么这两个事件就是并发的。  
+考虑一个能在串行程序中正确工作的函数。如果这个函数在并发调用时仍然能正确工作，那么这个函数是并发安全的，在这里并发调用是指，在没有额外同步机制的情况下，从两个或多个goroutine同时调用这个函数。这个概念也可以推广到其它函数，比如方法或者作用于特定类型的一些操作。如果一个类型的所有可访问方法和操作都是并发安全的，那么可称它为并发安全的类型。  
+让一个程序并发安全并不需要其中的每一个具体类型都是并发安全的。实际上，并发安全的类型其实是特例而不是普遍存在的，所以仅在文档指出类型是安全的情况下，才可以并发地访问一个变量。对于绝大部分变量，如要回避并发访问，要么限制变量只存在于一个goroutine内，要么维护一个更高层的互斥不变量。  
+与之对应的是，导出的包级别函数通常可以认为是并发安全的。因为包级别的变量无法限制在一个goroutine内，所以那些修改这些变量的函数就必须采用互斥机制。  
+函数并发调用时不能正常工作的情况很多，包括死锁、活锁以及资源耗尽。我们来重点讨论最重要的一种情形，即竞态。竞态是指多个goroutine按某些交错顺序执行时程序无法给出正确结果。竞态对于程序是致命的，因为它们可能会潜伏在程序中，出现频率很低，有可能仅在高负载环境或者使用特定的编译器、平台或架构时才出现。  
+我们常用一个经济损失的隐喻来解释竞态的严重性，在这里先考虑一个简单的银行账户程序：
+```Go
+package bank
+
+var balance int
+
+func Deposit(amount int) { balance = balance + amount }
+func Balance() { return balance }
+```
+对于一个如此简单的程序，我们一眼就可以看出，任意串行地调用Deposit和Balance都可以得到正确的结果。即Balance会输出之前存入的金额总数。但如果这些函数的调用顺序不是串行而是并行，Balance就不保证输出正确结果了。考虑如下两个goroutine，它们代表对一个共享账户的两笔交易：
+```Go
+// Alice:
+go func() {
+  bank.Deposit(200)         // A1
+  fmt.Println("=", bank.Balance())  // A2
+}()
+
+// Bob:
+go bank.Deposit(100)        // B
+```
+Alice存入200美元，然后查询她的余额，于此同时Bob存入了100美元。A1、A2两步与B是并发进行的，我们无法预测实际的执行顺序。列出所有情况：
+| Alice先 | Bob先 | Alice/Bob/Alice |
+| :---: | :---: | :---: |
+|A1 - 200|B - 100|A1 - 200|
+|A2 - "= 200"|A1 - 300|B - 300|
+|B - 300|A2 - "= 300"|A2 - "= 300"|
+在所有的情况下最终的账户余额都是300美元，唯一不同的是Alice看到的账户余额是否包含了Bob的交易，但客户对所有情况都不会有不满。  
+实际上还有第四种可能，Bob的存款在Alice的存款操作中间执行，晚于账户余额读取，但早于余额更新，这会导致Bob存的钱消失了。因为Alice的存款操作A1实际上是串行的两个操作，读部分和写部分，我们称之为A1r和A1w。
+```
+数据静态
+          0
+A1r       0     ... = balance + amount
+B       100
+A1w     100     balance = ...
+A2   "= 200"
+```
+在A1r之后，表达式`balance + amount`求值结果为200，这个值在A1w步骤中用于写入，完全没理会中间的存款操作。最终的余额仅有200美元！  
+程序中的这种状况是竞态的一种，称为数据竞态。数据竞态发生于两个goroutine并发读写同一个变量并且至少其中一个是写入时。  
+当发生数据竞态的变量类型是大于一个机器字长的类型时，事情就更复杂了。下面的代码并发把x更新为两个不同长度的slice。
+```Go
+var x []int
+go func() { x = make([]int, 10) }()
+go func() { x = make([]int, 1000000) }()
+x[999999] = 1 // 未定义行为
+```
+最后一个表达式中的x的值是未定义的，它可能是nil、一个长度为10的slice或者一个长度为1000000的slice。回想以下slice的三个部分：指针、长度和容量。如果指针来自于第一个make调用而长度来自第二个make调用，那么x会变成一个嵌合体，它名义上长度为1000000但底层的数组只有10个元素。  
+有三种方法来避免数据竞态。第一种方法是不要修改变量。考虑如下的map，它进行了延迟初始化，对于每个键，在第一次访问时才触发加载。如果Icon的调用是串行的，那么程序能正常工作，但如果Icon的调用是并发的，在访问map时就存在数据竞态。
+```Go
+var icons = make(map[string]image.Image)
+
+func loadIcon(name string) image.Image
+
+func Icon(name string) image.Image {
+  icon, ok := icons[name]
+  if !ok {
+    icon = loadIcon(name)
+    icons[name] = icon
+  }
+  return icon
+}
+```
+如果在创建其它goroutine之前就用完整的数据来初始化map，并且不再修改。那么无论多少goroutine也可以安全地并发调用icon，因为每个goroutine都只读取这个map。  
+第二种方法是避免从多个goroutine访问同一个变量。由于其它goroutine无法直接访问相关变量，因此它们就必须使用通道来向受限goroutine发送查询请求或者更新变量。这也是这句Go箴言的含义：“不要通过共享内存来通信，而应该通过通信来共享内存”。使用通道请求来代理一个受限变量的所有访问的goroutine称为该变量的监控goroutine。下面重写银行案例，用一个叫teller的监控goroutine限制balance变量：
+```Go
+package bank
+
+var deposits = make(chan int)
+var balances = make(chan int)
+
+func Deposit(amount int) { deposits<- amount }
+func Balance() int { return <-balances }
+
+func teller() {
+  var balance int
+
+  for {
+    select {
+      case amount := <-deposits:
+        balance += amount
+      case balances<- balance:
+    }
+  }
+}
+
+func init() {
+  go teller()
+}
+```
+即使一个变量无法在整个生命周期受限于单个goroutine，加以限制仍然可以是解决并发访问的好方法。比如一个常用的场景，可以通过借助通道来把共享变量的地址从上一步传入到下一步，从而在流水线上的多个goroutine之间共享该变量。在流水线中的每一步，在把变量地址传给下一步后就不再访问该变量了，这样所有对这个变量的访问都是串行的。换个说法，这个变量先受限于流水线的一步，再受限于下一步。  
+在下面的例子中，Cakes是串行受限的，首先受限于baker goroutine，然后受限于icer goroutine。
+```Go
+type Cake struct { state string }
+
+func baker(cooked chan<- *Cake) {
+  for {
+    cake := new(Cake)
+    cake.state = "cooked"
+    cooked<- cake
+  }
+}
+
+func icer(iced chan<- *Cake, cooked <-chan *Cake) {
+  for cake := range cooked {
+    cake.state = "iced"
+    iiced<- cake
+  }
+}
+```
+第三种避免数据竞态的办法是允许多个goroutine访问同一个变量，但在同一时间只有一个goroutine可以访问。这种方法称为互斥机制。
+
 ### 互斥锁 Mutex
+我们可以使用一个容量为1的通道来保证同一时间最多有一个goroutine能访问共享变量。一个计数上限为1的信号量称为二进制信号量。
+```Go
+var (
+  sema    = make(chan struct{}, 1)
+  balance int
+)
+
+func Deposit(amount int) {
+  sema<-  struct{}{}    // 获取令牌
+  balance = balance + amount
+  <-sema    //释放令牌
+}
+
+func Balance() int {
+  sema<- struct{}{}
+  b := balance
+  <-sema
+  return b
+}
+```
+互斥锁模式应用非常广泛，所以sync包有一个单独的Mutex类型来支持这种模式。它的Lock方法用于获取令牌，Unlock方法用于释放令牌：
+```Go
+import "sync"
+
+var (
+  mu      sync.Mutex
+  balance int
+)
+
+func Deposit(amount int) {
+  mu.Lock()
+  balance = balance + amount
+  mu.Unlock()
+}
+
+func Balance() int {
+  mu.Lock()
+  b := balance
+  mu.Unlock()
+  return b
+}
+```
+一个goroutine在每次访问银行的变量之前，它都必须先调用互斥量的Lock方法来获取一个互斥锁。如果其它goroutine已经取走了互斥锁，那么操作会一直阻塞到其它goroutine调用Unlock之后。互斥量保护共享变量。按照惯例，被互斥量保护的变量声明应当紧接在互斥量的声明之后。  
+在Lock和Unlock之间的代码，可以自由地读取和修改共享变量，这一部分称为临界区域。在锁的持有人调用Unlock之前，其它goroutine不能获取锁。所以很重要的一点是，goroutine在使用完成后就应当释放锁，另外，需要包括函数的所有分支，特别是错误分支。  
+因为Deposit和Balance函数中的临界区很短，所以直接在函数结束调用Unlock也很方便，但很多情况下临界区有很复杂的逻辑，这时候很难保证在每个分支都能调用Unlock函数，这时候我们可以使用defer语句来解决这个问题。
+```Go
+func Balance() int {
+  mu.Lock()
+  defer mu.Unlock()
+  return balance
+}
+```
+考虑下面的Withdraw函数。当成功时，余额减少了指定的数量，并且返回true，但如果余额不足，无法完成交易，Withdraw恢复余额并且返回false。
+```Go
+// 注意： 不是原子操作
+func Withdraw(amount int) bool {
+  Deposit(-amount)
+  if Balance() < 0 {
+    Deposit(amount)
+    return false
+  }
+  return true
+}
+```
+这个函数最终能给出正确的结果，但它有一个不良的副作用。在尝试进行超额提款时，在某个瞬间余额会降到0以下。这有可能会导致一个小额的取款会不合逻辑地被拒绝掉。所以当Bob尝试购买一辆跑车时，却会导致Alice无法支付早上的咖啡。Withdraw的问题在于不是原子操作：它包含三个串行的操作，每个操作都申请并释放了互斥锁，但对于整个序列没有上锁。  
+理想情况下，Withdraw应当为整个操作申请一次互斥锁。
+```Go
+// 注意：不正确的实现
+func Withdraw(amount int) bool {
+  mu.Lock()
+  defer mu.Unlock()
+  Deposit(-amount)
+  if Balance() < 0 {
+    Deposit(amount)
+    return false
+  }
+  return true
+}
+```
+Deposit会通过调用`mu.Lock()`来尝试再次获取互斥锁，但由于互斥锁是不能再入的，因此这会导致死锁，Withdraw会一直被卡住。  
+Go语言的互斥量是不可再入的。互斥量的目的是在程序执行过程中维持基于共享变量的特定不变量（invariant）。其中一个不变量是“没有goroutine正在访问这个共享变量”，但有可能互斥量也保护针对数据结构的其他不变量。当goroutine获取一个互斥锁的时候，它可能会假定这些不变量是满足的。当它获取到互斥锁之后，它可能会更新共享变量的值，这样可能会临时不满足之前的不变量。当它释放互斥锁锁时，它必须保证之前的不变量已经还原且又能重新满足。尽管一个可重入的互斥量可以确保没有其他goroutine可以访问共享变量，但是无法保护这些变量的其他不变量。  
+一个常见的解决方案是把Deposit这样的函数拆分为两部分：一个不导出的函数deposit，它假定已经获得互斥锁，并完成实际的业务逻辑；以及一个导出的函数Deposit，它用来获取锁并调用deposit。
+```Go
+func Withdraw(amount int) bool {
+  mu.Lock()
+  defer mu.Unlock()
+  deposit(-amount)
+  if balance < 0 {
+    deposit(amount)
+    return false
+  }
+  return true
+}
+
+func Deposit(amount int) {
+  mu.Lock()
+  defer mu.Unlock()
+  deposit(amount)
+}
+
+func deposit(amount int) {
+  balance += amount
+}
+
+func Balance() int {
+  mu.Lock()
+  defer mu.Unlock()
+  return balance
+}
+
+```
+
 ### 读写互斥锁 RWMutex
+Bob的100美元存款消失了，没有留下任何线索，Bob感到很焦虑，为了解决这个问题，Bob写了一个程序，每秒钟查询数百次他的账户余额。这个程序同时在他家里、公司里和他手机上运行。银行注意到快速增长的业务请求正在拖慢存款和取款操作，因为所有的Balance请求都是串行运行的，持有互斥锁并暂时妨碍了其它goroutine运行。  
+因为Balance函数只须读取变量的状态，所以多个Balance请求其实可以安全地并发运行，只要Deposit和Withdraw请求没有同时运行即可。在这种场景下，我们需要一种特殊类型的锁，它允许只读操作可以并发执行，但写操作需要获得完全独享的访问权限。这种锁称为多读单写锁，Go语言中的`sync.RWMutex`可以提供这种功能：
+```Go
+var mu sync.RWMutex
+var balance int
+
+func Balance() int {
+  mu.RLock()    // 读锁
+  defer mu.RUnlock()
+  return balance
+}
+```
+Balance函数现在可以调用RLock和RUnlock方法来分别获取和释放一个读锁。经过上面的修改后，Bob的绝大部分Balance请求可以并发运行且能更快完成。因此，锁可用的时间比例会更大，Deposit请求也能得到更及时的响应。
+
+RLock仅可用在临界区域对共享变量无写操作的情形。一般来讲，我们不应当假定那些逻辑上只读的函数和方法不会更新一些变量。仅在绝大部分goroutine都在获取读锁并且锁竞争比较激烈时，RWMutex才有优势。因为RWMutex需要更复杂的内部薄记工作，所以在竞争不激烈时它比普通的互斥锁慢。
+
 ### 内存同步
-### 延迟初始化
+你可能会对Balance方法也需要互斥锁感到奇怪。毕竟就，与Deposit不一样，它只包含单个操作，所以并不存在另外一个goroutine插在中间执行的风险。其实需要互斥锁的原因有两个。第一个是防止Balance插到其他操作中间。第二个原因是，同步不仅涉及多个goroutine的执行顺序问题，同步还会影响到内存。  
+现代的计算机一般都会有多个处理器，每个处理器都有内存的本地缓存。为了提高效率，对内存的写入是缓存在每个处理器中的，只在必要时才刷回内存。甚至刷回内存的顺序都可能与goroutine的写入顺序不一致。像通道通信或者互斥锁操作这样的同步原语都会导致处理器把累计的写操作刷回内存并提交，所以这个时刻之前goroutine的执行结果就保证了对运行在其它处理器的goroutine可见。  
+考虑如下代码片段的可能输出：
+```Go
+var x, y int
+go func() {
+  x = 1   // A1
+  fmt.Print("y:", y, " ") // A2
+}()
+
+go func() {
+  y = 1   // B1
+  fmt.Print("x:", x, " ") // B2
+}()
+```
+由于这两个goroutine并发运行且在没使用互斥锁的情况下访问共享变量，所以这里会有数据竞态。于是我们对程序每次的输出不一样不应该感到奇怪。我们可以想象到结果会是下面中的一个：
+```
+y:0 x:1
+x:0 y:1
+x:1 y:1
+y:1 x:1
+```
+但是，程序产生的如下两个输出就在我们的意料之外了：
+```
+x:0 y:0
+y:0 x:0
+```
+但在某些特定的编译器、CPU或者其它情况下，这些确实可能发生。在单个goroutine内，每个语句的效果保证按照执行的顺序发生，也就是说，goroutine是串行一致的。但在缺乏使用通道或者互斥量来显示同步的情况下，并不能保证所有的goroutine看到的事件顺序都是一致的。尽管goroutine A肯定能在读取y之前能观察到x=1的效果，但它并不一定能观察到goroutine B对y写入的效果，所以A可能会输出y的一个过期值。  
+尽管很容易把并发简单理解为多个goroutine中语句的某种交错执行方式，但正如上面例子所示，这并不是一个现代编译器和CPU的工作方式。因为赋值和Print对应不同的变量，所以编译器就可能会认为两个语句的执行顺序不会影响结果，然后就交换了这两个语句的执行顺序。CPU也有类似的问题，如果两个goroutine在不同的CPU上执行，每个CPU都有自己的缓存，那么一个goroutine的写入操作在同步到内存之前对另外一个goroutine的Print语句是不可见的。  
+这些并发问题都可以通过简单、成熟的模式来避免，即在可能的情况下，把变量限制到单个goroutine中，对于其它变量，使用互斥锁。
+
+### 延迟初始化：sync.Once
+延迟一个昂贵的初始化步骤到有实际需求的时刻是一个很好的实践。预先初始化一个变量会增加程序的启动延时，并且如果实际执行时有可能根本用不上这个变量，那么初始化也不是必需的。
+```Go
+var icons map[string]image.Image
+
+func loadIcons() {
+  icons = map[string]image.Image {
+    "spades.png": loadIcon("spades.png"),
+    "hearts.png": loadIcon("hearts.png"),
+    "diamonds.png": loadIcon("diamonds.png"),
+    "clubs.png": loadIcon("clubs.png"),
+  }
+}
+
+// 注意：并发不安全
+func Icon(name string) image.Image {
+  if icons == nil {
+    loadIcons()
+  }
+  return icons[name]
+}
+```
+对于那些只被一个goroutine访问的变量，上面的模式是没有问题的，但对于这个例子，在并发调用Icon时这个模式就是不安全的。类似于银行例子中最早版本的Deposit函数，Icon也包含多个步骤。直觉可能会告诉你，竞态带来的最严重的问题可能就是loadIcons函数会被调用多遍。当第一个goroutine正忙于加载图标时，其它goroutine进入Icon函数，会发现icons仍然是nil，所以仍然会调用loadIcons。但这个直觉并不准确，考虑在缺乏显式同步的情况下，编译器和CPU在能保证每个goroutine都满足串行一致性的基础上可以自由重排访问内存的顺序。loadIcons一个可能的语句重排结果如下所示。它在填充数据之前把一个空map赋给icons：
+```Go
+func loadIcons() {
+  icons = make(map[string]image.Image)
+  icons["spades.png"] = loadIcon("spades.png")
+  icons["hearts.png"] = loadIcon("hearts.png")
+  icons["diamonds.png"] = loadIcon("diamonds.png")
+  icons["clubs.png"] = loadIcon("clubs.png")
+}
+```
+因此，一个goroutine发现icons不是nil并不意味着变量的初始化肯定已经完成。保证所有goroutine都能观察到loadIcons效果最简单的方法就是用一个互斥锁来做同步：
+```Go
+var mu sync.Mutex   // 保护 icons
+var icons map[string]image.Image
+
+// 并发安全
+func Icon(name string) image.Image {
+  mu.Lock()
+  defer mu.Unlock()
+  if icons == nil {
+    loadIcons()
+  }
+  return icons[name]
+}
+```
+采用互斥锁访问icons的额外代价是两个goroutine不能并发访问这个变量，即使在变量已经安全完成初始化且不再做更改的情况下。使用一个可以并发读的锁就可以改善这个问题：
+```Go
+var mu sync.RWMutex
+var icons map[string]image.Image
+
+func Icon(name string) image.Image {
+  mu.RLock()
+  if icons != nil {
+    icon := icons[name]
+    mu.RUnlock()
+    return icon
+  }
+  mu.RUnlock()
+
+  mu.Lock()
+  if icons == nil {
+    loadIcons()
+  }
+  icon := icons[name]
+  mu.Unlock()
+  return icon
+}
+```
+这里有两个临界区域。goroutine首先获取一个读锁，查阅map，然后释放这个锁。如果条目能找到就返回它。如果条目没找到，goroutine再获取一个写锁，由于不先释放一个共享锁就无法直接把它升级到互斥锁，为了避免在过渡期其它goroutine已经初始化了icons，所以我们必需重新检查nil值。  
+上面的模式具有更好的并发性，但它更复杂并且容易出错。幸运的是，sync包提供针对一次性初始化问题的特化解决方案：`sync.Once`。从概念上来讲，Once包含一个布尔变量和一个互斥量，布尔变量记录初始化是否已经完成，互斥量则负责保护这个布尔变量和客户端的数据结构。Once唯一的方法Do以初始化函数作为它的参数。
+```Go
+var loadIconsOnce sync.Once
+var icons map[string]image.Image
+
+// 并发安全
+func Icon(name string) image.Image {
+  loadIconsOnce.Do(loadIcons)
+  return icons[name]
+}
+```
+每次调用`Do(loadIcons)`时会先锁定互斥量并检查里面的布尔变量。在第一调用时，这个布尔变量为假，Do会调用loadIcons然后把变量设置为真。后续的调用相当于空操作，只是通过互斥量的同步来保证loadIcons对内存产生的效果对所有的goroutine可见。以这种方式来使用`sync.Once`，可以避免变量在正确构造之前就被其它goroutine分享。
+
 ### 竞态检测器
+即使以最大努力的仔细，仍然很容易在并发上犯错误。幸运的是，Go语言运行时和工具链装备了一个精致并易于使用的动态分析工具：竞态检测器。  
+简单地把`-race`命令行参数加到`go build`、`go run`、`go test`命令里即可使用该功能。它会让编译器为你的应用或测试构建一个修改后的版本，这个版本有额外的手法用于高效记录在执行时对共享变量的所有访问，以及读写这些变量的goroutine标识。除此之外，修改后的版本还会记录所有的同步事件，包括go语句、通道操作、`(*sync.Mutex).Lock`调用、`(*sync.WaitGroup).Wait`调用等。  
+竞态检测器会研究事件流，找到那些有问题的案例，即一个goroutine写入一个变量后，中间没有任何同步的操作，就有另外一个goroutine读写了该变量。这种案例表明有对共享变量的并发访问，即数据竟态。这个工具会输出一份报告，包括变量的标识以及读写goroutine当时的调用栈。  
+竟态检测器报告所有实际运行了的数据竟态。然而，他只能检测到那些正在运行时发生的竟态，无法用来保证肯定不会发生竟态。为了获得最佳效果，请确保你的测试包含了并发使用包的场景。  
+由于存在额外的薄记工作，带竟态检测功能的程序在执行时需要更长的时间和更多的内存，但即使对于很多生产环境的任务，这种额外开支也是可以接受的。对于那些不常发生的竟态，使用竟态检测器可以帮你节省数小时甚至数天的调试时间。
+
+### 示例：并发非阻塞缓存
+我们创建一个并发非阻塞的缓存系统，它能解决在并发实战很常见但已有的库也不能很好解决的一个问题：函数记忆（memorizing）问题，即缓存函数的结果，达到多次调用但只须计算一次的效果。我们的解决方案将是并发安全的，并且要避免简单地对整个缓存使用单个锁而带来的锁争夺问题。  
+我们使用下面的httpGetBody函数作为示例。它会发起一个HTTP GET请求并读取响应体。调用这个函数相当昂贵，所以我们希望避免不必要的重复调用。
+```Go
+func httpGetBody(url string) (interface{}, error) {
+  resp, err := http.Get(url)
+  if err != nil {
+    return nil, err
+  }
+  defer resp.Body.Close()
+  return ioutil.ReadAll(resp.Body)
+}
+```
+最后一行略有一些微妙，ReadAll返回两个结果，一个\[\]byte和一个error，因为它们分别可以直接赋给httpGetBody声明的结果类型interface\{\}和一个error，所以我们可以直接返回这个结果而不用做额外的处理。httpGetBody选择这样的结果类型是为了满足我们要做的缓存系统的设计。  
+初始版本：
+```Go
+package memo
+
+// Memo 缓存了调用Func的结果
+type Memo struct {
+  f     Func
+  cache map[string]result
+}
+
+// Func 是用于记忆化的函数类型
+type Func func(key string) (interface{}, error)
+
+type result struct {
+  value interface{}
+  err error
+}
+
+func New(f Func) *Memo {
+  return &Memo{f: f, cache: make(map[string]result)}
+}
+
+// 注意：并发不安全
+func (memo *Memo) Get(key string) (interface{}, error) {
+  res, ok := memo.cache[key]
+  if !ok {
+    res.value, res.err = memo.f(key)
+    memo.cache[key] = res
+  }
+  return res.value, res.err
+}
+```
+一个Memo实例包含了被记忆的函数f，以及缓存，类型为从字符串到result的一个映射表。每个result都是调用f产生的结果对。  
+下面的例子展示如何使用Memo。对于一串请求URL中的每个元素，首先调用Get，记录延时和它返回的数据长度：
+```Go
+m := memo.New(httpGetBody)
+for url := range incomingURLs() {
+  start := time.Now()
+  value, err := m.Get(url)
+  if err != nil {
+    log.Print(err)
+  }
+  fmt.Printf("%s, %s, %d bytes\n", 
+    url, time.Since(start), len(value.([]byte)))
+}
+```
+我们可以使用testing包来系统地调查一下记忆的效果:
+```shell
+$ go test -v
+=== RUN   TestMemo
+https://golang.google.cn/, 521.513193ms, 6268 bytes
+https://pkg.go.dev/, 932.270008ms, 11367 bytes
+https://zh.cppreference.com/, 1.29850611s, 41566 bytes
+https://golang.google.cn/, 862ns, 6268 bytes
+https://pkg.go.dev/, 606ns, 11367 bytes
+https://zh.cppreference.com/, 548ns, 41566 bytes
+--- PASS: TestMemo (2.76s)
+PASS
+ok      memo/memo       2.766s
+```
+这次测试中所有的Get都是串行运行的。  
+因为HTTP请求用并发来改善的空间很大，所以我们修改测试来让所有请求并发进行。这个测试使用`sync.WaitGroup`来做到等最后一个请求完成后再返回的效果。
+```Go
+m := memo.New(httpGetBody)
+var n sync.WaitGroup
+for url := range incomingURLs() {
+  n.Add(1)
+  go func(url string) {
+    start := time.Now()
+    value, err := m.Get(url)
+    if err != nil {
+      log.Print(err)
+    }
+    fmt.Printf("%s, %s, %d bytes\n", 
+      url, time.Since(start), len(value.([]byte)))
+    n.Done()
+  }
+}
+b.Wait()
+```
+这次的测试运行起来快很多，但是它并不是每一次都能正常运行。我们可能能注意到意料之外的缓存无效，以及缓存命中后返回错误的结果，甚至崩溃。  
+让缓存并发安全最简单的方法就是用一个基于监控的同步机制。我们需要的是给Memo加一个互斥量，并在Get函数的开头获取互斥锁，在返回前释放互斥锁：
+```Go
+type Memo struct {
+  f     Func
+  cache map[string]result
+  mu    sync.Mutex
+}
+
+// 并发安全
+func (memo *Memo) Get(key string) (interface{}, error) {
+  memo.mu.Lock()
+  res, ok := memo.cache[key]
+  if !ok {
+    res.value, res.err = memo.f(key)
+    memo.cache[key] = res
+  }
+  memo.mu.Unlock()
+  return res.value, res.err
+}
+```
+现在并发运行没问题了。但是这次对Memo的修改让我们之前对性能的优化失效了。由于每次调用f时都上锁，因此Get把我们希望并行的I/O操作串行化了。我们需要的是一个非阻塞的缓存。  
+下面的一个版本的Get实现中，主调goroutine会分两次获取锁：第一次用于查询，第二次用于在查询无返回结果时进行更新。在两次之间，其它goroutine也可以使用缓存。
+```Go
+func (memo *Memo) Get(key string) (interface{}, error) {
+  memo.mu.Lock()
+  res, ok := memo.cache[key]
+  memo.mu.Unlock()
+  if !ok {
+    res.value, res.err = memo.f(key)
+    
+    // 在两个临界区之前，可能会有多个goroutine来计算f(key) 并且更新map
+    memo.mu.Lock()
+    memo.cache[key] = res
+    memo.mu.Unlock()
+  }
+  return res.value, res.err
+}
+```
+性能再度得到提升，但我们注意到某些URL被获取了两次。在两个或者多个goroutine几乎同时调用Get来获取同一个URL时就会出现这个问题。在理想情况下我们应该避免这种额外的处理。这个功能有时称为重复抑制。在下面的Memo版本中，map的每个元素是一个指向entry结构的指针。除了与之前一样包含一个已经记住的函数f调用结果之外，每个entry还新加了一个通道ready。在设置entry的result字段后，通道会关闭，正在等待的goroutine会收到广播，然后就可以从entry读取结果了。
+```Go
+type entry struct {
+  res result
+  ready chan struct {}
+}
+
+type Memo struct {
+  f     Func
+  cache map[string]*entry
+  mu    sync.Mutex
+}
+
+func New(f Func) *Memo {
+  return &Memo{f: f, cache: make(map[string]*entry)}
+}
+
+func (memo *Memo) Get(key string) (interface{}, error) {
+  memo.mu.Lock()
+  e := memo.cache[key]
+  if e == nil {
+    // 对key的第一次访问，这个goroutine负责计算数据和广播数据
+    e = &entry{ ready: make(chan struct{}{}) }
+    memo.cache[key] = e
+    memo.mu.Unlock()
+
+    e.res.value, e.res.err = memo.f(key)
+    close(e.ready)  // 广播数据已经准备完毕
+  } else {
+    memo.mu.Unlock()
+
+    <-e.ready   // 等待数据准备完毕
+  }
+
+  return e.res.value, e.res.err
+}
+```
+现在调用Get会先获取保护缓存的互斥锁，再从map中查询一个指向已有entry的指针，如果没有查找到，就分配并插入一个新的entry，最后释放锁。如果要查询的entry存在，那么它的值可能还没有准备好，所以主调goroutine就需要等待entry准备好才能读取entry中的result数据，具体的实现方法就是从ready通道读取数据，这个操作会一直阻塞到通道关闭。  
+如果要查询的entry不存在，那么当前的goroutine就需要新插入一个没有准备好的entry到map里，并负责调用慢函数f，更新entry，最后向其它正在等待的goroutine广播数据已准备完毕的消息。  
+注意，entry中的变量`e.res.value`和`e.res.err`被多个goroutine共享。创建entry的goroutine设置了这两个变量的值，其他goroutine在收到数据准备完毕的广播后开始读这两个变量。尽管变量被多个goroutine访问，但此处不需要加上互斥锁。ready通道的关闭先于其它goroutine收到广播事件，所以第一个goroutine的变量写入事件也先于后续多个goroutine的读取事件。  
+上面的Memo代码使用一个互斥量来保护被多个调用Get的goroutine访问的map变量。接下来会对比另外一种设计，在新的设计中，map变量限制在一个监控goroutine中，而Get的调用者则不得不改为发送消息。  
+Func、result、entry的声明与之前一致  
+```Go
+
+type Func func(key string) (interface{}, error)
+
+type result struct {
+  value interface{}
+  err error
+}
+
+type entry struct {
+  res result
+  ready chan struct{} // 当res准备好后关闭该通道
+}
+```
+尽管Get的调用者通过这个通道来与监控goroutine通信，但是Memo类型现在包含一个通道requests。该通道的元素类型是request。通过这种数据结构，Get的调用者向监控goroutine发送被记忆函数的参数、以及一个通道response，结果在准备好后就通过response通道发回。
+```Go
+type request struct {
+  key       string
+  response  chan<- result
+}
+
+type Memo struct { requests chan request }
+
+func New(f Func) *Memo {
+  memo := &Memo{ requests: make(chan request) }
+  go memo.server(f)
+  return memo
+}
+
+func (memo *Memo) Get(key string) (interface{}, error) {
+  response := make(chan result)
+  memo.requests<- request{key, response}
+  res := <-response
+  return res.value, res.err
+}
+
+func (memo *Memo) Close() {
+  close(memo.requests)
+}
+```
+上面的Get方法创建了一个响应通道，放在了请求里边，然后把它发送给监控goroutine，再马上从响应通道中读取。  
+如下所示，cache变量被限制在监控goroutine中。监控goroutine从request通道中循环读取，直到该通道被Close方法关闭。对于每个请求，它先查询缓存，如果没找到则创建并插入一个新的entry。
+```Go
+func (memo *Memo) server(f func) {
+  cache := make(map[string]*entry)
+  for req := range memo.requests {
+    e := cahce[req.key]
+    if e == nil {
+      // 对这个key的第一次请求
+      e = &entry{ready: make(chan struct{})}
+      cache[req.key] = e
+      go e.call(f, req.key)
+    }
+    go e.deliver(req.response)
+  }
+}
+
+func (e *entry) call(f Func, key string) {
+  e.res.val, e.res.err = f(key)
+  close(e.ready)
+}
+
+func (e *entry) deliver(response chan<- result) {
+  <-e.ready
+  response<- e.res
+}
+```
+与基于互斥锁的版本类似，对于指定键的一次请求负责在该键上调用函数f，保存结果到entry中，最后通过关闭ready通道来广播准备完毕状态。  
+对同一个键的后续请求会在map中找到已有的entry，然后等待结果准备好，最后通过响应通道把结果发回给调用Get的客户端goroutine。其中call和deliver方法都需要在独立的goroutine中运行，以确保监控goroutine能持续处理新请求。
+
 ### goroutine与线程
+
+**可增长的栈**  
+每个OS线程都有一个固定大小的栈内存（通常是2MB），栈内存区域用于保存在其他函数调用期间那些正在执行或临时暂停的函数中的局部变量。这个固定大小的栈既太大又太小。对一个小的goroutine，2MB的栈是一个巨大的浪费，比如有的goroutine仅仅等待一个WaitGroup再关闭一个通道。在Go程序中，一次创建十万左右的goroutine也不罕见，对于这种情况，栈就太大了。另外，对于复杂和深度递归的函数，固定大小的栈始终不够大。改变这个固定大小可以提高空间效率并允许创建更多的线程，或者也可以容许更深的递归函数，但无法同时做到上面的两点。  
+
+作为对比，一个goroutine在生命周期开始时只有一个很小的栈，典型情况下为2KB。与OS线程类似，goroutine的栈也用于存放那些正在执行或临时暂停的函数中的局部变量。但与OS线程不同的是，goroutine的栈不是固定大小的，它可以按需增大或缩小。goroutine的栈大小限制可以达到1GB，比线程典型的固定大小栈高几个数量级。
+
+**goroutine调度**  
+OS线程由OS内核来调度。每隔几毫秒，一个硬件时钟中断发到CPU，CPU调用一个叫调度器的内核函数。这个函数暂停当前正在运行的线程，把它的寄存器信息保存到内存，查看线程列表并决定接下来运行哪一个线程，再从内存恢复线程的寄存器信息，最后继续执行选中的线程。因为OS线程由内核来调度，所以控制权限从一个线程到另外一个线程需要一个完整的上下文切换：即保存一个线程的状态到内存，再恢复另外一个线程的状态，最后更新调度器的数据结构。考虑这个操作涉及的内存局域性以及涉及的内存访问数量，还有访问内存所需的CPU周期数量的增加，这个操作其实是很慢的。  
+Go运行时包含一个自己的调度器，这个调度器与使用一个称为m：n调度的技术（因为它可以复用/调度m个goroutine到n个OS线程）.Go 调度器与内核调度器的工作类似，但Go调度器只需关心单个Go程序的goroutine调度问题。  
+与操作系统的线程调度器不同的是，Go调度器不是由硬件时钟来定期触发的，而是由特定的Go语言结构来触发的。比如当一个goroutine调用`time.Sleep`或被通道阻塞或对互斥量操作时，调度器就会将这个goroutine设为休眠模式，并运行其它goroutine直到前一个可重新唤醒为止。因为它不需要切换到内核语境，所以调用一个goroutine比调度一个线程成本低很多。
+
+**GOMAXPROCS**  
+Go调度器使用GOMAXPROCS参数来确定需要使用多少个OS线程来同时执行Go代码。默认值是机器上的CPU数量，所以在一个有8个CPU的机器上，调度器会把Go代码同时调度到8个OS线程上。（GOMAXPROCS是m：n调度中的n）正在休眠或者正被通道通信阻塞的goroutine不需要占用线程。阻塞在I/O和其它系统调用中或调用非Go语言写的函数的goroutine需要一个独立的OS线程，但这个线程不计算在GOMAXPROCS内。  
+可以用GOMAXPROCS环境变量或者`runtime.GOMAXPROCS`函数来显式控制这个参数。可以用一个小程序来看看GOMAXPROCS的效果，这个程序无止境地输出0和1：
+```Go
+for {
+  go fmt.Print(0)
+  fmt.Print(1)
+}
+```
+我们分别用不同的GOMAXPROCS来运行：
+```shell
+$ GOMAXPROCS=1 go run main.go
+111111111111111111111000000000000000000000111...
+
+$ GOMAXPROCS=2 go run main.go
+010101010101010101011001100101011010010100110...
+```
+在第一次运行时，每次最多只能有一个goroutine运行。最开始是主goroutine，它输出1。在一段时间时间以后，Go调度器让主goroutine休眠。并且唤醒另一个输出0的goroutine，让它有机会执行。在第二次运行时，这里有两个可用的OS线程，所以两个goroutine可以同时运行，以一个差不多的速率输出两个数字。
+
 
 ## 测试
 ### go test工具
