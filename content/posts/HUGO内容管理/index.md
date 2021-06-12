@@ -3,7 +3,7 @@ title: "HUGO内容管理"
 subtitle: ""
 date: 2021-05-20T15:10:12+08:00
 lastmod: 2021-05-20T15:10:12+08:00
-draft: true
+draft: false
 author: ""
 description: ""
 
@@ -390,6 +390,30 @@ disableKinds = ["taxonomy", "term"]
 {{</* ref "document.md#reference" */>}}
 {{</* relref "document.md#reference" */>}}
 ```
+
+## URL管理
+默认HUGO会把你的网站放在public/下面，不过你可以在配置文件中指定一个`publishDir`。在配置中的`permalinks`选项可以用来调整content下目录的URL路径。  
+配置举例：
+```yaml
+permalinks:
+  posts: /:year/:month/:title/
+```
+该配置会影响到content/posts目录下的文件输出URL。并且输出格式是按照"/年/月/日"。
+
+Permalink配置值：
+|配置|作用|
+| :---: | :---: |
+| :year | 4位数字的年份 |
+| :month | 2位的月份 |
+| :monthname | 月份的名称 |
+| :day | 两位的天数 |
+| :weekday | 一位的星期（星期天是0） |
+| :yearday | 1到3位的一年中的某一天 |
+| :section | 章节名称 |
+| :title | 文章的标题 |
+| :slug | 可以在front matter配置 |
+| :filename | 文件名称 |
+
 
 ## 菜单
 可以把一些链接加入菜单，然后在导航栏页面显示出来。

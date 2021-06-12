@@ -18,7 +18,7 @@
         </h2>
 
         {{- /* Categories Page */ -}}
-        {{- if eq $taxonomies "categories" -}}
+        {{- if or (eq $taxonomies "categories") (eq $taxonomies "questions") -}}
             <div class="categories-card">
                 {{- range $terms -}}
                     {{- $term := .Term -}}

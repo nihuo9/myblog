@@ -3,7 +3,7 @@ title: "Go语言基础"
 subtitle: ""
 date: 2021-05-23T16:07:30+08:00
 lastmod: 2021-05-23T16:07:30+08:00
-draft: true
+draft: false
 author: ""
 description: ""
 
@@ -13,8 +13,8 @@ page:
 upd: ""
 authorComment: ""
 
-tags: ["GO"]
-categories: ["编程语言"]
+tags: ["Go"]
+categories: ["Go"]
 
 hiddenFromHomePage: false
 hiddenFromSearch: false
@@ -28,6 +28,7 @@ resources:
   src: "featured-image.png"
 ---
 
+本文基本上是摘录了Go程序设计语言，介绍了Go语言的基本内容。
 <!--more-->
 
 ## 程序结构
@@ -669,7 +670,7 @@ r := [...]int{88: -1}
 ```
 定义了一个拥有100个元素的数组r，除了最后一个元素是-1外，其它元素都是0.  
   
-如果一个数组的元素类型是可比较的。  
+如果一个数组的元素类型是可比较的，那么这个数组也是可以比较的。  
 注意在GO中当调用一个函数的时候，每个传入的参数都会创建一个副本然后赋值给对应的函数变量，所以函数接受的是一个副本。
 也就是说Go把数组何其他类型都看成值传递。
 
@@ -3627,7 +3628,7 @@ $ GOMAXPROCS=2 go run main.go
 ```
 在第一次运行时，每次最多只能有一个goroutine运行。最开始是主goroutine，它输出1。在一段时间时间以后，Go调度器让主goroutine休眠。并且唤醒另一个输出0的goroutine，让它有机会执行。在第二次运行时，这里有两个可用的OS线程，所以两个goroutine可以同时运行，以一个差不多的速率输出两个数字。
 
-
+<!--
 ## 测试
 ### go test工具
 ### Test函数
@@ -3646,14 +3647,5 @@ $ GOMAXPROCS=2 go run main.go
 ### 注意事项
 
 ## CGO
-### unsafe.Sizeof、Alignof和Offsetof
-### unsafe.Pointer
-### CGO 基础
-### 类型转换
-### 函数调用
-### 内部机制
-### 封装qsort
-### CGO内存模型
-### C++类包装
-### 静态库和动态库
-### 编译和链接参数
+详情请看：[CGO编程](https://oshirisu.site/posts/cgo编程/)
+-->
