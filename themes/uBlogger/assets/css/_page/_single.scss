@@ -164,6 +164,7 @@
       border-spacing: 0;
       background: $table-background-color;
       border-collapse: collapse;
+      word-break: break-word;
 
       [theme=dark] & {
         background: $table-background-color-dark;

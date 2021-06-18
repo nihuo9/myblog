@@ -14,7 +14,7 @@ upd: ""
 authorComment: ""
 
 tags: ["Markdown"]
-categories: ["Markdown"]
+categories: ["其它"]
 
 hiddenFromHomePage: false
 hiddenFromSearch: false
