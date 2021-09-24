@@ -97,6 +97,7 @@
 
   p {
     margin: $margin-article;
+    //text-indent: 2rem;
   }
 
   b, strong {
@@ -286,6 +287,17 @@
           line-height: 8rem;
         }
       }
+    }
+  }
+
+  .illustration {
+    .picture {
+      text-align: center;
+    }
+
+    .comment {
+      text-align: center;
+      font-size: 16px;
     }
   }
 }

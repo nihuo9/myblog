@@ -901,3 +901,24 @@ git rebase --continue | --skip | --abort | --quit | --edit-todo
 
 * 解决冲突
   发生冲突时，`git rebase`将会在第一个有问题的commit处停止并在树上留下冲突标记。你可以使用`git diff`去定位标记并且编辑文件解决冲突。之后你需要告诉git冲突已被解决，典型的可以使用`git add` 命令。之后你可以使用`git rebase --continue`命令继续，或者你也可以使用`git rebase --abort`放弃`git rebase`
+
+## git describe
+该命令产生版本号，如果符合条件的tag指向最新提交则只是显示tag的名字否则会有相关的后缀来描述该tag之后有多少次提交以及最新的提交commit id。不加任何参数的情况下，git describe 只会列出带有注释的tag
+```shell
+$ git describe
+v1.0.3-6-g0c2b1cf
+```
+其中：
+* 6:表示自打tag v1.0.3以来有6次提交
+* g0c2b1cf：g 为git的缩写
+* 0c2b1cf：7位字符表示为最新提交的commit id 前7位
+
+另外可以加参数
+```shell
+$ git describe --tags --always --dirty="-dev"
+v1.0.3-6-g0c2b1cf-dev
+```
+其中：
+* --tags：如果当前版本已经有tag则直接输出此tag名：v1.0.3
+* --always: 如果不是，则显示缩写的提交名称
+* --dirty：如果本地仓库有修改，则认为是dirty的，则追加-dev
