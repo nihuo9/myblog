@@ -1,0 +1,41 @@
+/*
+tar file
+*/
+func test8()  {
+	var buf bytes.Buffer
+	tarGzFile, err := os.OpenFile("dir.tar.gz", os.O_RDONLY, 0)
+	if err != nil {
+		log.Fatal(err)
+	}
+	tarFile, err := gzip.NewReader(tarGzFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	n, err := buf.ReadFrom(tarFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("tar file len:", n)
+
+	tr := tar.NewReader(&buf)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("size of %s: %d, type:%c\n", hdr.Name, hdr.Size, hdr.Typeflag)
+	}
+}
+
+/*hash*/
+func test9() {
+	var h maphash.Hash
+
+	h.WriteString("hello, ")
+	fmt.Printf("%#x\n", h.Sum64())
+	fmt.Printf("%v\n", h.Sum([]byte{}))
+	fmt.Printf("%s\n", fmt.Sprintf("%#x", h.Sum64()))
+}
